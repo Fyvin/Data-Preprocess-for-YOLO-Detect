@@ -1,0 +1,42 @@
+import numpy as np
+import os
+import cv2
+
+"""Rsize图片"""
+def Resize(image, resize_long = 1280, h=1944, w=2592):
+    if h<w:
+        w_new = resize_long
+        h_new = int(resize_long / w * h)
+    resize_img = cv2.resize(image, (w_new,h_new))
+    return resize_img
+
+if __name__=="__main__":
+    path = r"D:\all\enhance\images"
+    for dirpath, _, filenames in os.walk(path):
+        for file in filenames:
+            if file.endswith(".bmp"):
+                bmp_path = os.path.join(dirpath, file)
+                bmp = cv2.imread(bmp_path, 0)
+                resize_img = Resize(bmp, resize_long=1280)
+                cv2.imwrite(f"{bmp_path}", resize_img)
+
+#
+#
+# """复制文件"""
+# def copy_file(src_dir, dst_dir):
+#     """
+#     :param src_dir: 原文件所在dir
+#     :param dst_dir: 目标dir
+#     :return: ×
+#     """
+#     for dirpath, _, filenames in os.walk(src_dir):
+#         for file in filenames:
+#             if file.lower().endswith(".bmp"): # ".txt"
+#                 img_path = os.path.join(dirpath, file)
+#                 shutil.copy(img_path, dst)
+#
+#
+# if __name__ == "__main__":
+#     src_fir = r"D:\xm\robot\all\origin"
+#     dst_dir = r"D:\xm\robot\all\train\images" # "labels"
+#     copy_file(src_dir, dst_dir)
