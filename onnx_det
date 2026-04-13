@@ -1,0 +1,170 @@
+import onnx
+import onnxruntime as ort
+import numpy as np
+import cv2
+
+"""yolo_det输出：(B,5,N)
+    B - batch
+    c - cx/cy/w/h/cls score
+    N - num"""
+def cv_show(img):
+    cv2.namedWindow("img", cv2.WINDOW_NORMAL)
+    cv2.imshow("img", img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+class YOLO11_Det:
+    def __init__(self, onnx_path, img_file, conf=0.25, iou=0.7):
+        self.conf = conf
+        self.iou = iou
+        self.img0 = cv2.imread(img_file)
+        self.gray = cv2.imread(img_file, 0)
+        self.session = ort.InferenceSession(onnx_path,
+                                            providers=["CPUExecutionProvider", "CUDAExecutionProvider"]
+                                            if ort.get_device()=="GPU"
+                                            else ["CPUExecutionProvider"])
+        # 类别映射
+        self.classes = {
+            0: "dust"
+        }
+        # 固定随机颜色（保证每次运行一样）
+        np.random.seed(42)
+        self.color_palette = np.random.randint(
+            0, 255, size=(len(self.classes), 3), dtype=np.uint8
+        )
+
+
+    """输出onnx ->raw推理结果"""
+    def get_session(self):
+        session = self.session
+        name = session.get_inputs()[0].name
+        shape = session.get_inputs()[0].shape
+        new_shape = shape[2:]
+        input_img, ratio, pad = self.preprocess(new_shape)
+        outputs = session.run(None,{name:input_img})[0]
+        return outputs,input_img, ratio, pad
+        outputs = session.run_img
+
+
+    """图像预处理-> 符合模型输入格式(1,3,h,w)"""
+    def preprocess(self, new_shape):
+        """调整输入图像大小并 letterbox 填充"""
+        img = self.img0
+        o_shape = img.shape[:2] #hw
+        r = min(new_shape[0]/o_shape[0], new_shape[1]/o_shape[1])
+        ratio = r, r
+        unpad = int(round(o_shape[1]*r)), int(round(o_shape[0]*r)) #wh
+        pad = (new_shape[1]-unpad[0])/2, (new_shape[0]-unpad[1])/2 #wh
+        print(unpad, pad)
+        if unpad[::-1]!= new_shape:
+            img = cv2.resize(img, unpad, interpolation=cv2.INTER_LINEAR)
+            top, bottom = int(round(pad[1]-0.1)), int(round(pad[1]+0.1))
+            left, right = int(round(pad[0]-0.1)), int(round(pad[0]+0.1))
+            img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114,114,114))
+        img = np.ascontiguousarray(np.einsum("hwc->chw",img)[::-1], dtype=np.float32) / 255.0
+        img = img[None] if len(img.shape)==3 else img
+        print(img.shape)
+        return img, ratio, pad
+
+
+    """处理outputs输出-> [nc]--[c->cxcywh/conf/cls] """
+    def best_conf_box(self, outputs, input_img, ratio, pad, cls_num=1, conf=0.25, iou=0.7):
+        """
+        :param outputs: session.run[0]
+        :param input_img:
+        :param ratio:
+        :param pad:
+        :param cls_num:
+        :param conf:
+        :param iou:
+        :return:
+        """
+        output = outputs[0]
+        output = np.einsum("cn->nc",output)
+        if cls_num>1:
+            pred = output[:,4:]
+            pred_conf = np.max(pred, axis=-1)
+            output = np.insert(output, 4, pred_conf, axis=-1)
+        else:
+            pred_conf = output[:, 4]
+            output = np.insert(output, 4, pred_conf, axis=-1) # x,y,w,h,conf(最大类别概率),class
+        x = output[output[:,4]>0.25]
+        x = x[cv2.dnn.NMSBoxes(x[:, :4], x[:, 4], conf, iou)]
+        return x
+
+
+    """xywh->x1y1x2y2"""
+    def xywh2xyxy(self, *box):
+        """
+        将xywh转换为左上角点和左下角点
+        Args:
+            box:
+        Returns: x1y1x2y2
+        """
+        ret = [box[0] - box[2] // 2, box[1] - box[3] // 2, \
+               box[0] + box[2] // 2, box[1] + box[3] // 2]
+        return ret
+
+
+    """恢复目标在原图位置"""
+    def post_process(self, box, ratio, pad):
+        x, y, w, h, conf, cls = box[0]
+        # print(box)
+        x1, y1, x2, y2 = self.xywh2xyxy(x, y, w, h)
+        if ratio[0]>1:
+            ret_x1, ret_x2 = (x1 - pad[0]) / ratio[0], (x2 - pad[0]) / ratio[0]
+            ret_y1, ret_y2 = (y1 - pad[1]) / ratio[1], (y2 - pad[1]) / ratio[1]
+        else:
+            ret_x1, ret_x2 = (x1 - pad[0]) * ratio[0], (x2 - pad[0]) * ratio[0]
+            ret_y1, ret_y2 = (y1 - pad[1]) * ratio[1], (y2 - pad[1]) * ratio[1]
+        # print(ret_x1, ret_x2, ret_y1, ret_y2, conf, cls) #1570.9828091684435 1603.733342217484 2485.380463752665 2518.130996801706 0.7363693 0.7363693
+        ret = np.array([ret_x1, ret_y1, ret_x2, ret_y2, conf, cls]) # 6,
+        ret = ret[None] if len(ret.shape)==1 else ret # 1,6 方便处理
+        return ret
+
+
+    """原图-绘制目标类别"""
+    def draw(self, res):
+        """
+        将预测框绘制在image上
+        Args:
+            res: 预测框数据
+            image: 原图
+            cls: 类别列表，类似["apple", "banana", "people"]  可以自己设计或者通过数据集的yaml文件获取
+        Returns:
+        """
+        image = self.img0
+        cls = self.classes
+        for r in res:
+            # 画框
+            image = cv2.rectangle(image, (int(r[0]), int(r[1])), (int(r[2]), int(r[3])), (0, 255, 0), 2)
+            # 表明类别
+            cls_name = cls[int(r[5])] #cls
+            conf = round(float(r[4]),2)
+            text = "{}:{}".format(cls_name, conf)
+            h, w = int(r[3]) - int(r[1]), int(r[2]) - int(r[0])  # 计算预测框的长宽
+            font_size = min(h / 640, w / 640) * 3  # 计算字体大小（随框大小调整）
+            # print(image.shape)
+            image = cv2.putText(image, text, (max(10, int(r[0])), max(20, int(r[1]))), cv2.FONT_HERSHEY_COMPLEX,
+                                max(font_size, 0.3), (0, 0, 255), 1)  # max()为了确保字体不过界
+        return image, cls_name, conf
+
+
+    """整合处理"""
+    def all_process(self):
+        outputs, input_img, ratio, pad  = self.get_session()
+        x = self.best_conf_box(outputs, input_img, ratio, pad)
+        ret = self.post_process(x, ratio, pad)
+        image, cls_name, conf = self.draw(ret)
+        return image, cls_name, conf
+
+
+if __name__ == "__main__":
+        onnx_path = r"D:\download\X-AnyLabeling-3.2.0\pre_onnx_model\best_dust.onnx"
+        img_file = r"D:\xm\marryland_COB8\F16N01AM\F16_3\train\images\20250327163022_IO_3_1.bmp"
+        seg = YOLO11_Det(onnx_path=onnx_path, img_file=img_file)
+        image, cls_name, conf = seg.all_process() # 画图 目标类别 置信度(0.xx)
+
+
+
