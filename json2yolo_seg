@@ -1,0 +1,64 @@
+
+import os
+import numpy as np
+import json
+
+
+def classfier(label):
+    if label == "A":
+        class_type = 0
+    elif label == "B":
+        class_type = 1
+    elif label == "C":
+        class_type = 2
+    elif label == "T":
+        class_type = 3
+    return class_type
+
+def json2yolo(data, i, w, h):
+    points = data["shapes"][i]["points"]
+    label = data["shapes"][i]["label"]
+    class_type = classfier(label)
+    new_data = ""
+    for n in range(len(points)):
+        x, y = points[n]
+        norm_x, norm_y = round(x / w, 6), round(y / h, 6)
+        new_data += f" {norm_x} {norm_y}"
+    new_data = f"{class_type} {new_data}"
+    return new_data
+
+
+def process(file_path):
+    try:
+        with open(file_path, "r") as f:
+            data = json.load(f)
+            h, w = data["imageHeight"], data["imageWidth"]
+            if 'shapes' in data and len(data['shapes']) > 0:
+                for i in range(len(data['shapes'])):
+                    yolo_seg_data = json2yolo(data, i, w, h)
+                    with open(yolo_file_path, "a") as f:
+                        f.write(yolo_seg_data)
+
+    except FileNotFoundError:
+        print(f"错误：找不到文件 {file_path}")
+    except json.JSONDecodeError:
+        print(f"错误：文件 {file_path} 不是有效的JSON格式")
+    except Exception as e:
+        print(f"发生错误：{str(e)}")
+    return None
+
+
+if __name__ == "__main__":
+    path = r"/all/origin/toge/label_json"  #A
+    yolo_path = r"/all/origin/toge/label"
+    # path = r"D:\xm\robot\0723data\B\label" #B
+    # yolo_path = r"D:\xm\robot\0723data\B\yolo_label"
+    # path = r"D:\xm\robot\0723data\T\label" #T
+    # yolo_path = r"D:\xm\robot\0723data\T\yolo_label"
+    os.makedirs(yolo_path, exist_ok=True)
+    for file in os.listdir(path):
+        file_path = os.path.join(path, file)
+        yolo_file_path = os.path.join(yolo_path, os.path.basename(file)[:-5] + ".txt")
+        process(file_path)
+
+
