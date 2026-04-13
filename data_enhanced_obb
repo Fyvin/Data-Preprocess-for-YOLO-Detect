@@ -1,0 +1,354 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import random
+import shutil
+import math
+# import albumentations as A
+
+
+
+def cv_show(img):
+    cv2.namedWindow('image',cv2.WINDOW_NORMAL)
+    cv2.imshow('image',img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+class transform():
+    def __init__(self, path = r"D:\xm\robot\all\origin\toge", dst = r"D:\xm\robot\all\origin\enhance"):
+        self.path = path
+        self.dst = dst
+
+
+    """遍历path下所有文件夹，随机选择n张图片复制到dst"""
+    def random_select(self, n):
+        """
+        :param path: 要遍历的文件夹路径
+        :param dst: 复制到目标文件夹
+        :param n: 选取图片数
+        :return: 随机选取的n张图片
+        """
+        # 目标文件夹(image/label)
+        img_dst = self.dst + "/image"   #目标文件夹(image)
+        label_dst = self.dst + "/label" #目标文件夹(label)
+        os.makedirs(img_dst, exist_ok=True)
+        os.makedirs(label_dst, exist_ok=True)
+
+        bmp_files, txt_files = [], []
+        for dirpath, _, filenames in os.walk(self.path): # 遍历path下所有文件夹的".bmp"文件
+            for file in filenames:
+                if file.endswith(".bmp"):
+                    bmp_path = os.path.join(dirpath, file) # 单张图片路径
+                    bmp_files.append(bmp_path)             # 整合所有.bmp图片路径
+        random.shuffle(bmp_files)                          # 打乱所有图片
+        select_shuffle_img = bmp_files[:n]                 # 选取前n张增强
+
+        for i, bmp_path in enumerate(select_shuffle_img): # 遍历shuffle图片
+            bmp = cv2.imread(bmp_path, 0)
+            enhance_bmp, flip_types, M = self.transform_pipe(image=bmp, func_arg=pipe_line) # 增强图片
+            s = "None" if flip_types else ""
+            cv2.imwrite(f"{img_dst}/{i+3050}.bmp", enhance_bmp)
+
+            txt_path = bmp_path.replace("image", "label").replace(".bmp", ".txt") # 单个标签路径
+            dst_txt_path = f"{label_dst}/{i+3050}.txt"
+            if flip_types: # 判断txt是否需要转换(含写入保存)
+                self.Label_transform(bmp, txt_path, dst_txt_path, flip_types, M)
+            else:
+                shutil.copy(txt_path, dst_txt_path)
+        return select_shuffle_img
+
+
+    """对应坐标转换"""
+    def Label_transform(self, image, txt_path, dst_txt_path, flip_types, M):
+        h, w = 3672, 5496
+        middle_h = h / 2
+        middle_w = w / 2
+        data_new = ""
+        new_lines = []
+        with (open(txt_path, "r")) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                data = line.strip().split()
+                if len(data) == 9:
+                    class_type = data[0]
+                    points = [float(data[i]) for i in range(1, 9)]
+                    p1 = (points[0], points[1])  # (x1, y1)
+                    p2 = (points[2], points[3])  # (x2, y2)
+                    p3 = (points[4], points[5])  # (x3, y3)
+                    p4 = (points[6], points[7])  # (x4, y4)
+                    for type in flip_types:
+                        if type == "hor": #水平翻转
+                            new_p1 = (1 - p1[0], p1[1])
+                            new_p2 = (1 - p2[0], p2[1])
+                            new_p3 = (1 - p3[0], p3[1])
+                            new_p4 = (1 - p4[0], p4[1])
+                            p1, p2, p3, p4 = new_p4, new_p3, new_p2, new_p1
+                            rotated_norm_points = [p1[0], p1[1], p2[0], p2[1], p3[0], p3[1], p4[0], p4[1]]
+                        # ----------------------------------------------------------
+                        elif type == "ver": #垂直翻转
+                            new_p1 = (p1[0], 1 - p1[1])
+                            new_p2 = (p2[0], 1 - p2[1])
+                            new_p3 = (p3[0], 1 - p3[1])
+                            new_p4 = (p4[0], 1 - p4[1])
+                            p1, p2, p3, p4 = new_p4, new_p3, new_p2, new_p1
+                            rotated_norm_points = [p1[0], p1[1], p2[0], p2[1], p3[0], p3[1], p4[0], p4[1]]
+                        #----------------------------------------------------------
+                        elif type == "rotate": #按中心旋转
+                            abs_points = np.array([
+                                [p1[0] * w, p1[1] * h],
+                                [p2[0] * w, p2[1] * h],
+                                [p3[0] * w, p3[1] * h],
+                                [p4[0] * w, p4[1] * h]
+                            ], dtype=np.float32)
+
+                            abs_points = abs_points.reshape(-1, 1, 2) # 调整输入格式：N×1×2 （-1自动计算第一个维度）
+                            rotated_abs_points = cv2.transform(abs_points, M)  # 绝对值 4×1×2
+                            rotated_abs_points = rotated_abs_points.reshape(-1, 2)  # 展平成 4×2
+                            rotated_norm_points = []
+                            for (x_abs, y_abs) in rotated_abs_points:
+                                x_norm = round(x_abs / w, 6)  # 归一化x坐标
+                                y_norm = round(y_abs / h, 6)  # 归一化y坐标
+                                rotated_norm_points.extend([x_norm, y_norm])  # 合并为「x1,y1,...,x4,y4」
+
+                        else:
+                            new_lines.append(line)
+                            continue
+
+                        # 5. 生成新的标注行（保持原标注格式）
+                    new_line = f"{class_type} {' '.join(map(str, rotated_norm_points))}\n"
+                    new_lines.append(new_line)
+
+
+
+        with open(dst_txt_path, "w") as f:
+            f.writelines(new_lines)
+
+
+
+    # 增强管道
+    def transform_pipe(self, image, func_arg):
+        aug_img = image.copy()
+        flip_types = []
+        M = ""
+        for item in func_arg: # func_arg -- pipe_line
+            func, prob = item[:2] # item -- (func, 0.25, "type"); func, prob-- func, 0.25
+            args = item[2:] if len(item) > 2 else ()   # 函数的额外参数 # args -- "type"
+            if random.random() < prob:
+                result = func(aug_img, *args) # return: image, type // image, type, M
+                if isinstance(result, tuple) and len(result) > 1:
+                    aug_img, type = result[:2]  # image, type
+                    if len(result) == 3:
+                        M = result[2]
+                    flip_types.append(type if type else "")  # args[0]是flip_type
+                else:
+                    aug_img = result
+        return aug_img, flip_types, M
+
+
+    # -------------------------------------------------------------------------------------------------------------------------------
+    """光增强/衰减"""
+    def Light_Decay_radius(self, image, strength=100, type="EN"):
+        """
+        :param image: 原图
+        :param strength: 光强度
+        :param type: 光增强or衰减
+        :return:
+        """
+        aug_img = image.copy()
+        if aug_img.shape == 2:
+            h, w = aug_img.shape
+            min_radius = int(h * 0.3) # 最小10%目标区域强光
+            max_radius = int(h * 0.5)
+            radius = np.random.randint(min_radius, max_radius, 1)  #
+            pos_h = np.random.randint(radius, (min(h, w) - radius), 1)
+            pos_w = np.random.randint(radius, 4400, 1)
+            pos_h = int(pos_h[0])
+            pos_w = int(pos_w[0])
+            radius = int(radius[0])
+            for j in range(pos_w - radius, pos_w + radius):     #列
+                for i in range(pos_h - radius, pos_h + radius): #行
+                    distance = np.sqrt(math.pow((pos_h - i), 2) + math.pow((pos_w - j), 2)) #欧氏距离
+                    if distance < radius:
+                        result = 1 - distance / radius
+                        result = result * strength # 中心最强，向外衰减
+                        if type == "EN":
+                            aug_img[i, j] = min((aug_img[i, j] + result), 0, 255)
+                            # image[i, j, 0] = min((image[i, j, 0] + result), 0, 255)
+                        elif type == "DE":
+                            aug_img[i, j] = min((aug_img[i, j] - result), 0, 255)
+                            # image[i, j, 2] = min((image[i, j, 2] - result), 0, 255)
+        aug_img = aug_img.astype(np.uint8)
+        return aug_img
+
+
+    """掩膜"""
+    def Mask(self, image):
+        aug_img = image.copy()
+        h, w = 2400, 2900 # 目标主体大概位置
+        min_mask, max_mask = int(h * 0.1), int(h * 0.3)
+        mask_size = np.random.randint(min_mask, max_mask, 1)
+        mask_coord = min(h, w) - mask_size
+        pos_h = np.random.randint(mask_size, mask_coord, 1)  # 随机高取值
+        pos_w = np.random.randint(1000, 4400, 1)  # 随机宽取值
+        pos_h = int(pos_h[0])
+        pos_w = int(pos_w[0])
+        mask_size = int(mask_size[0])
+        # print(min_mask, max_mask, mask_size)
+        aug_img[pos_h:pos_h + mask_size, pos_w:pos_w + mask_size] = 0
+        return aug_img
+
+
+    """模糊"""
+    def Blur(self, image, type="Gau"):
+        """
+        :param image: 原图
+        :param blur_radius: 高斯核大小
+        :return:
+        """
+        aug_img = image.copy()
+        k = random.randint(2, 5) * 2 + 1
+        if type == "Gau":
+            aug_img = cv2.GaussianBlur(aug_img, (k,k), 0)
+        if type == "Me":
+            aug_img = cv2.GaussianBlur(aug_img, k)
+        return aug_img
+
+
+    """噪声"""
+    def Noise(self, image, noise_level=5):
+        """
+        :param image: 原图
+        :param noise_level: 噪声
+        :return:
+        """
+        # 转换为float类型以避免计算溢出
+        aug_img = image.astype(np.float32)
+        noise = np.random.normal(0, noise_level, aug_img.shape).astype(np.float32)
+        aug_img += noise
+        np.clip(aug_img, 0, 255, out=aug_img)
+        return aug_img.astype(np.uint8)
+
+
+    """随机亮度/gamma变换"""
+    def random_brightness_contrast(self, image, brightness_limit=0.1, contrast_limit=0.1):
+        """
+        随机调整亮度和对比度（向量化操作，速度快）
+        :param image: 输入图像（cv2格式，uint8）
+        :param brightness_limit: 亮度调整范围（±值，如0.2表示±20%）
+        :param contrast_limit: 对比度调整范围（±值）
+        :param p: 应用概率
+        :return: 调整后的图像
+        """
+        aug_img = image.copy()
+        # 随机生成对比度因子 alpha（1±contrast_limit）
+        alpha = 1.0 + random.uniform(-contrast_limit, contrast_limit)
+        # 随机生成亮度偏移 beta（-brightness_limit*255 ~ brightness_limit*255）
+        beta = random.uniform(-brightness_limit, brightness_limit) * 255
+        # 向量化操作：alpha*image + beta，避免循环
+        aug_img = np.clip(alpha * aug_img + beta, 0, 255).astype(np.uint8)
+        return aug_img
+
+
+    """Gamma变换"""
+    def random_gamma(self, image, gamma_limit=(95, 105)):
+        """
+        随机Gamma变换（向量化操作，速度快）
+        :param image: 输入图像（cv2格式，uint8）
+        :param gamma_limit: Gamma范围（整数，如(90,110)表示0.9~1.1）
+        :param p: 应用概率
+        :return: 变换后的图像
+        """
+        aug_img = image.copy()
+        gamma = random.randint(*gamma_limit) / 100.0 #？？？？？
+        inv_gamma = 1.0 / gamma
+        lookup_table = np.array([((i / 255.0) ** inv_gamma) * 255
+                                 for i in np.arange(0, 256)]).astype("uint8")
+        # 应用查找表
+        aug_img = cv2.LUT(aug_img, lookup_table)
+        return aug_img
+
+    "曝光-中值"
+    def adjust_median(self, image):
+        sub_image = image.copy()  # 复制输入图像，避免修改原图
+        # 问题1修正：randint仅传2个参数，且转为标量（用.item()提取数组唯一元素）
+        value = random.randint(30, 60)  # 目标亮度的中位数（50~128之间随机）
+
+        # 计算图像中位数（仅考虑非零值更合理，避免纯黑区域干扰）
+        non_zero_pixels = sub_image[sub_image > 0]  # 过滤纯黑像素（值为0）
+        median_value = np.median(non_zero_pixels) if len(non_zero_pixels) > 0 else 1
+
+        # 问题2修正：亮度调整逻辑（目标中位数 / 原始中位数 = 缩放系数alpha）
+        alpha = value / median_value  # alpha：像素值的缩放比例
+        # 用convertScaleAbs调整亮度（alpha=缩放系数，beta=亮度偏移量，此处无需偏移设为0）
+        aug_img = cv2.convertScaleAbs(sub_image, alpha=alpha, beta=0)
+        return aug_img
+
+
+    '''自动曝光'''
+    def adjust_mean(self, image, target_mean=100):
+        value = random.randint(20, 30)
+        if len(image.shape) > 2:
+            gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray_image = image.copy()
+        current_mean = np.mean(gray_image)
+        if current_mean == 0:
+            return image
+        exposure_ratio = target_mean / current_mean
+        aug_img = np.clip(image * exposure_ratio, 0, 255).astype(np.uint8)
+        return aug_img
+
+
+    """水平/垂直翻转"""
+    def Flip(self, image, type="hor"):
+        """随机水平翻转"""
+        if type=="hor":
+            return cv2.flip(image, 1), type  # 1表示水平翻转
+        if type=="ver":
+            return cv2.flip(image, 0), type  # 0表示垂直翻转
+        else:
+            return image, None
+
+
+    """图像旋转"""
+    def Rotate(self, image, type="rotate", angle=None):
+        if type=="rotate":
+            h, w = image.shape[:2]
+            center = (w / 2, h / 2)
+            if angle is None:
+                angle = random.randint(-10, 10)
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                aug_img = cv2.warpAffine(image, M, (w, h))
+                # cv_show(rotated_img)
+                return aug_img, type, M
+
+
+if __name__ == "__main__":
+    path = r"D:\all\ng9"
+    dst = r"D:\all\enhance"
+    t = transform(path,dst)
+
+    pipe_line = [
+        # (Light_Decay_radius, 0.5),
+        # (t.Mask, 0.25),
+        (t.Blur, 0.3),
+        (t.Noise, 0.2),
+        (t.random_brightness_contrast, 0.3),
+        (t.random_gamma, 0.3),
+        # (t.adjust_mean, 0.3)
+        # (t.Flip, 0.5, "hor"),
+        # (t.Flip, 0.5, "ver"),
+        # (t.Rotate, 0.25, "rotate")
+    ]
+    t.random_select(41)
+
+
+
+
+
+
+
