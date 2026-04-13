@@ -1,0 +1,317 @@
+import os
+import cv2
+import numpy as np
+import onnxruntime as ort
+
+"""
+YOLO11 旋转目标检测OBB
+1、ONNX模型推理、可视化
+2、ONNX输出格式: x_center, y_center, width, height, class1_confidence, ..., classN_confidence, angle
+3、支持不同尺寸图片输入、支持旋转NMS过滤重复框、支持ProbIoU旋转IOU计算
+"""
+def cv_show(img):
+    cv2.namedWindow("img", cv2.WINDOW_NORMAL)
+    cv2.imshow("img", img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+class JT_decoder():
+    def __init__(self, img_path, model_weights = r"./best_vcsel.onnx"):
+        self.img_path = img_path
+        self.img = cv2.imread(self.img_path)
+        self.gray = cv2.imread(self.img_path, 0)
+        self.model_weights = model_weights
+        self.shape = self.img.shape[:2]
+        # session = getattr(self, "_session", None)
+        self._session = self.load_model(self.model_weights)
+
+
+    def letterbox(self, new_shape=(1280, 1280), color=(0, 0, 0), auto=False, scale_fill=False, scale_up=False, stride=32):
+        """
+        将图像调整为指定尺寸，同时保持长宽比，添加填充以适应目标输入形状。
+        :param img: 输入图像
+        :param new_shape: 目标尺寸
+        :param color: 填充颜色
+        :param auto: 是否自动调整填充为步幅的整数倍
+        :param scale_fill: 是否强制缩放以完全填充目标尺寸
+        :param scale_up: 是否允许放大图像
+        :param stride: 步幅，用于自动调整填充
+        :return: 调整后的图像、缩放比例、填充尺寸(dw, dh)
+        """
+        img = self.img.copy()
+        if isinstance(new_shape, int):
+            new_shape = (new_shape, new_shape)
+        r = min(new_shape[0] / self.shape[0], new_shape[1] / self.shape[1])  # 计算缩放比例
+        if not scale_up:
+            r = min(r, 1.0)
+        ratio = r, r
+        new_unpad = int(round(self.shape[1] * r)), int(round(self.shape[0] * r))
+        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+        if auto:
+            dw, dh = np.mod(dw, stride), np.mod(dh, stride)
+        elif scale_fill:
+            dw, dh = 0.0, 0.0
+            new_unpad = (new_shape[1], new_shape[0])
+            ratio = new_shape[1] / self.shape[1], new_shape[0] / self.shape[0]
+        dw /= 2  # 填充均分
+        dh /= 2
+        if self.shape[::-1] != new_unpad:
+            img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+        return img, ratio, (dw, dh)
+
+
+    def load_model(self, weights):
+        """
+        加载ONNX模型并返回会话对象。
+        :param weights: 模型权重文件路径
+        :return: ONNX运行会话对象
+        """
+        session = ort.InferenceSession(weights, providers=['CPUExecutionProvider'])
+        return session
+
+
+    def run_inference(self, session, image_bytes, imgsz=(1280, 1280)):
+        """
+        对输入图像进行预处理，然后使用ONNX模型执行推理。
+        :param session: ONNX运行会话对象
+        :param image_bytes: 输入图像的字节数据
+        :param imgsz: 模型输入的尺寸
+        :return: 推理结果、缩放比例、填充尺寸
+        """
+        img, ratio, (dw, dh) = self.letterbox(new_shape=imgsz)  # 调整图像尺寸
+        img = np.ascontiguousarray(img.transpose((2,0,1))[::-1],dtype=np.float32)/255.0  # 调整CWH顺序 且按RGB排序
+        img = img[None] if len(img.shape==3) else img
+        input_name = session.get_inputs()[0].name
+        result = session.run(None, {input_name: img})  # 执行模型推理
+        return result, ratio, (dw, dh)
+
+
+    def parse_onnx_output(self, output, ratio, pad, conf_threshold=0.7, iou_threshold=0.7):
+        detections = output[0].T  # nc 33600,15
+        # print(detections.shape)
+        num_classes = detections.shape[1] - 5 #10
+        if num_classes > 0:
+            class_confidences = detections[:, 4:4 + num_classes] # 33600,10
+            class_ids = np.argmax(class_confidences, axis=1) # 33600,
+            confidences = class_confidences[np.arange(len(class_ids)), class_ids] # 33600, 所有行最大索引对应conf值
+            # print(confidences.shape)
+        else:
+            confidences = detections[:, 4]
+            class_ids = np.zeros_like(confidences, dtype=int)
+        mask = confidences > conf_threshold # 最大conf>thresh的行索引
+        if not np.any(mask):
+            return []
+        selected = detections[mask] # 26,15
+        # print(selected.shape)
+        confidences = confidences[mask] # 26,
+        class_ids = class_ids[mask] # 26,
+
+        x_center = (selected[:, 0] - pad[0]) / ratio[0]
+        y_center = (selected[:, 1] - pad[1]) / ratio[1]
+        widths = selected[:, 2] / ratio[0]
+        heights = selected[:, 3] / ratio[1]
+        angles = selected[:, -1]
+        boxes = np.stack([x_center, y_center, widths, heights, angles], axis=1) #boxes = np.hstack([x_center, y_center, widths, heights, angles])
+        keep_indices = self.rotated_nms_with_probiou(boxes, confidences, iou_threshold)
+        results = []
+        for idx in keep_indices:
+            obb_corners = self.calculate_obb_corners(*boxes[idx])
+            results.append({
+                "position": obb_corners,
+                "confidence": float(confidences[idx]),
+                "class_id": int(class_ids[idx]),
+                "angle": float(angles[idx])
+            })
+        return results
+
+
+    #计算协方差
+    def _get_covariance_matrix(self, obb):
+        """
+        计算旋转边界框的协方差矩阵。
+        :param obb: 旋转边界框 (Oriented Bounding Box)，包含中心坐标、宽、高和旋转角度
+        :return: 协方差矩阵的三个元素 a, b, c
+        """
+        widths = obb[..., 2] / 2
+        heights = obb[..., 3] / 2
+        angles = obb[..., 4]
+        cos_angle = np.cos(angles)
+        sin_angle = np.sin(angles)
+        a = (widths * cos_angle) ** 2 + (heights * sin_angle) ** 2
+        b = (widths * sin_angle) ** 2 + (heights * cos_angle) ** 2  # (widths * sinθ)² + (heights * cosθ)²
+        c = widths * cos_angle * heights * sin_angle
+        return a, b, c
+
+
+    def batch_probiou(self, obb1, obb2, eps=1e-7):
+        """
+        计算旋转边界框之间的 ProbIoU。
+        :param obb1: 第一个旋转边界框集合
+        :param obb2: 第二个旋转边界框集合
+        :param eps: 防止除零的极小值
+        :return: 两个旋转边界框之间的 ProbIoU
+        """
+        x1, y1 = obb1[..., 0], obb1[..., 1]
+        x2, y2 = obb2[..., 0], obb2[..., 1]
+        a1, b1, c1 = self._get_covariance_matrix(obb1)
+        a2, b2, c2 = self._get_covariance_matrix(obb2)
+        t1 = ((a1[:, None] + a2) * (y1[:, None] - y2) ** 2 + (b1[:, None] + b2) * (x1[:, None] - x2) ** 2) / (
+                (a1[:, None] + a2) * (b1[:, None] + b2) - (c1[:, None] + c2) ** 2 + eps) * 0.25
+        t2 = ((c1[:, None] + c2) * (x2 - x1[:, None]) * (y1[:, None] - y2)) / (
+                (a1[:, None] + a2) * (b1[:, None] + b2) - (c1[:, None] + c2) ** 2 + eps) * 0.5
+        t3 = np.log(((a1[:, None] + a2) * (b1[:, None] + b2) - (c1[:, None] + c2) ** 2) /
+                    (4 * np.sqrt((a1 * b1 - c1 ** 2)[:, None] * (a2 * b2 - c2 ** 2)) + eps) + eps) * 0.5
+        bd = np.clip(t1 + t2 + t3, eps, 100.0)
+        hd = np.sqrt(1.0 - np.exp(-bd) + eps)
+        return 1 - hd
+
+
+    def rotated_nms_with_probiou(self, boxes, scores, iou_threshold=0.7):
+        """
+        使用 ProbIoU 执行旋转边界框的非极大值抑制（NMS）。
+        :param boxes: 旋转边界框的集合
+        :param scores: 每个边界框的置信度得分
+        :param iou_threshold: IoU 阈值，用于确定是否抑制框
+        :return: 保留的边界框索引列表
+        """
+        order = scores.argsort()[::-1]  # 根据置信度得分降序排序
+        keep = []
+        while len(order) > 0:
+            i = order[0] #第一个框
+            keep.append(i) #添加第一个框
+            if len(order) == 1:
+                break
+            remaining_boxes = boxes[order[1:]] #剩余所有框
+            iou_values = self.batch_probiou(boxes[i:i + 1], remaining_boxes).squeeze(0) # 计算iou
+            mask = iou_values < iou_threshold  # 保留 IoU 小于阈值的框
+            order = order[1:][mask]
+        return keep
+
+
+    def calculate_obb_corners(self, x_center, y_center, width, height, angle):
+        """
+        根据旋转角度计算旋转边界框的四个角点。
+        :param x_center: 边界框中心的 x 坐标
+        :param y_center: 边界框中心的 y 坐标
+        :param width: 边界框的宽度
+        :param height: 边界框的高度
+        :param angle: 旋转角度
+        :return: 旋转边界框的四个角点坐标
+        """
+        cos_angle = np.cos(angle)  # 计算旋转角度的余弦值
+        sin_angle = np.sin(angle)  # 计算旋转角度的正弦值
+        dx = width / 2  # 计算宽度的一半
+        dy = height / 2  # 计算高度的一半
+        # 计算旋转边界框的四个角点坐标
+        corners = [
+            (int(x_center + cos_angle * dx - sin_angle * dy), int(y_center + sin_angle * dx + cos_angle * dy)),
+            (int(x_center - cos_angle * dx - sin_angle * dy), int(y_center - sin_angle * dx + cos_angle * dy)),
+            (int(x_center - cos_angle * dx + sin_angle * dy), int(y_center - sin_angle * dx - cos_angle * dy)),
+            (int(x_center + cos_angle * dx + sin_angle * dy), int(y_center + sin_angle * dx - cos_angle * dy)),
+        ]
+        return corners  # 返回角点坐标
+
+
+    """获取每个数字id和position()"""
+    def save_detections(self, detections):
+        """
+        在图像上绘制旋转边界框检测结果并保存。
+        :param image: 原始图像
+        :param detections: 检测结果列表
+        :param output_path: 保存路径
+        """
+        det_info_list = []
+        for det in detections:
+            corners = det['position']  # 获取旋转边界框的四个角点
+            confidence = det['confidence']  # 获取置信度
+            class_id = det['class_id']  # 获取类别ID
+            center_x = (corners[0][0])
+            # center_x = (corners[0][0] + corners[1][0] + corners[2][0] + corners[3][0]) / 4
+            det_info_list.append((center_x, class_id, confidence, corners))
+        det_info_list_sorted = sorted(det_info_list, key=lambda x: x[0]) #x轴排序
+        poss = [item[-1] for item in det_info_list_sorted] # 单独存位置信息
+        ids = [item[1] for item in det_info_list_sorted]
+        return ids, poss
+
+
+    # ---------------- 加条件限制 -----------------
+    def count_gray(self, pos):
+        h, w = self.gray.shape
+        x1, y1 = pos[2]  # 第一个对角顶点（x=列，y=行）
+        x2, y2 = pos[0]  # 第二个对角顶点
+        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+        # 修正坐标顺序：确保 x1 < x2，y1 < y2（避免切片为空）
+        x_min = max(0,min(x1, x2))
+        x_max = min(w, max(x1, x2))
+        y_min = max(0, min(y1, y2))
+        y_max = min(h, max(y1, y2))
+        # ---------------------- 步骤2：转换为灰度图并裁剪区域 ----------------------
+        roi_gray = self.gray[y_min:y_max, x_min:x_max]  # +1是因为切片左闭右开
+        if roi_gray.size == 0:
+            print("警告：裁剪的矩形区域为空，请检查坐标！")
+        else:
+            # ---------------------- 步骤3：计算灰度差和低灰度像素数 ----------------------
+            # 1. 灰度差（区域内最大灰度 - 最小灰度）
+            gray_min = np.min(roi_gray)
+            gray_max = np.max(roi_gray)
+            gray_diff = gray_max - gray_min
+            # 2. 灰度值 < 20 的像素数（用布尔索引计数）
+            low_gray_count = np.sum(roi_gray < 20)
+            # 3.高宽
+            h_roi, w_roi = y_max-y_min, x_max-x_min
+            return gray_diff, low_gray_count,h_roi, w_roi
+
+
+    """总处理"""
+    def all_process(self, conf_threshold=0.7, iou_threshold=0.7, imgsz=(1280, 1280)):
+        bgr = self.img.copy()
+        try:
+            # 1. 加载模型
+            session = self._session
+            # 3. 预处理
+            img, ratio, (dw, dh) = self.letterbox()
+            img = img.transpose((2, 0, 1))[::-1].astype(np.float32) / 255.0
+            img = np.expand_dims(img, 0)
+            # 4. 模型推理
+            input_name = session.get_inputs()[0].name
+            raw_output = session.run(None, {input_name: img})[0]
+            # 5. 解析检测结果
+            detections = self.parse_onnx_output(raw_output, ratio, (dw, dh), conf_threshold, iou_threshold)
+
+            # 6. 提取 ID 顺序
+            ids, poss = self.save_detections(detections)
+            for pos in poss:
+                gray_diff, low_gray, h, w = self.count_gray(pos)
+                if gray_diff > 190 and low_gray > 20:
+                    return "NG"
+
+            result = "".join(str(i) for i in ids)
+            if len(ids) == 6:
+                if (int(result[:3]) < 2 or int(result[:3]) > 100) or (int(result[3:]) < 3 or int(result[3:]) > 140):
+                    return "NG"
+            else:
+                return "NG"
+            return result
+        except Exception as e:
+            return "NG"
+
+
+# 主函数：加载参数
+if __name__ == "__main__":
+    import time
+    path = r"D:\all\train\image"
+    for img in os.listdir(path):
+        img_path = os.path.join(path, img)
+        model = JT_decoder(img_path = img_path)
+        since = time.time()
+        results = model.all_process()
+        end = time.time() - since
+        print(results, round(end,2))
+    # img_file = r"D:\all\test\vcsel.bmp"
+    # decoder_jt = JT_decoder(img_path = img_file)
+    # result = decoder_jt.all_process()  # 执行批量处理
+    # print(result, img_file)
