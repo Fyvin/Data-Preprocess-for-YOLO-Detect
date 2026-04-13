@@ -1,0 +1,148 @@
+import onnx
+import onnxruntime as ort
+import numpy as np
+import cv2
+
+
+def cv_show(img):
+    cv2.namedWindow("img", cv2.WINDOW_NORMAL)
+    cv2.imshow("img", img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+class YOLO11_Seg:
+    def __init__(self, onnx_path = r"D:\download\X-AnyLabeling-3.2.0\pre_onnx_model\best.onnx", img_file = r"D:\xm\robot\all\test\MVST_Pic_2025_07_19_18_51_36.bmp"):
+        self.session = ort.InferenceSession(
+            onnx_path,
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+            if ort.get_device() == "GPU"
+            else ["CPUExecutionProvider"]
+        )
+        self.img0 = cv2.imread(img_file)
+        self.o_shape = self.img0.shape[:2]
+        # cv_show(self.img0)
+        # self.onnx_model = onnx.load(onnx_path)
+        # onnx.checker.check_model(self.onnx_model)
+
+
+    def all_process(self, conf=0.7, iou=0.7, nm=32):
+        outputs, ratio, pad = self.get_session(conf, iou, nm)
+        # 取最佳置信度框
+        x, proto = self.best_conf_box(outputs)
+        print(x.shape, proto.shape)
+        # 缩放 + 二值化
+        scaled_masks, binary_masks = self.post_process(x, proto, pad)
+        # 画图 + center/angle
+        img, results = self.draw_contours(binary_masks)
+        return img, results
+
+
+    def get_session(self, conf=0.7, iou=0.7, nm=32):
+        session = self.session
+        name = session.get_inputs()[0].name
+        shape = session.get_inputs()[0].shape # bnhw
+        new_shape = shape[2:] #hw
+        input_img, ratio, pad = self.preprocess(new_shape)
+        outputs = session.run(None, {name:input_img})
+        # print(outputs[0],outputs[1])
+        return outputs, ratio, pad
+
+
+    "输入图像预处理"
+    def preprocess(self, new_shape):
+        img = self.img0
+        o_shape = self.o_shape # hw
+        r = min(new_shape[0] / o_shape[0], new_shape[1] / o_shape[1]) # hw
+        ratio = r,r
+        new_unpad = int(round(o_shape[1] * r)), int(round(o_shape[0] * r)) # wh
+        # 判断是否要resize+填充
+        if new_unpad[::-1] != new_shape:
+            img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)  # 比例resize
+            pad = (new_shape[1] - new_unpad[0])/2, (new_shape[0] - new_unpad[1])/2 # 填充
+            top, bottom = int(round(pad[1]-0.1)), int(round(pad[1]+0.1))
+            left, right = int(round(pad[0]-0.1)), int(round(pad[0]+0.1))
+            img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
+        # 转换：HWC -> CHW -- BGR 转 RGB -- 除以 255 -- contiguous -- 添加维度
+        img = np.ascontiguousarray(np.einsum("HWC->CHW", img)[::-1], dtype= np.float32) / 255.0
+        img_process = img[None] if len(img.shape) == 3 else img
+        print(img_process.shape,pad)
+        return img_process, ratio, pad
+
+
+    """最佳置信度框"""
+    def best_conf_box(self, outputs, nm=32, conf=0.25, iou=0.7):
+        x, proto = outputs[0], outputs[1]  # (bcn)-(1,40,33600) / (bcwh)-(1,32,320,320)
+        # print(x.shape, proto.shape)
+        x = np.einsum("bcn->bnc", x)  # bnc(1,33600,4+4+nm)
+        x = x[np.amax(x[..., 4:-nm], axis=-1) > conf]  # 保留(单个框所有类别置信度取最大值>0.7)的框(1,33600-k,4+4+nm)
+        x = np.c_[x[..., :4], np.amax(x[..., 4:-nm], axis=-1), np.argmax(x[..., 4:-nm], axis=-1), x[..., -nm:]]  # argmax为类别索引例如 "A
+        x = x[cv2.dnn.NMSBoxes(x[:, :4], x[:, 4], conf, iou)]
+        return x, proto
+
+
+    """后处理 - mask还原原图尺寸 + 二值化方便后续画轮廓处理"""
+    def post_process(self, x, proto, pad, nm=32):
+        # 处理掩膜
+        mask = x[:, -nm:] # N,nm
+        # 初步掩膜 - 相乘 - 展平proto
+        b, c, w, h = proto.shape[:4]
+        proto = proto.reshape(c, -1) #nm, W*H
+        # print(mask.shape, proto.shape)
+        masks = np.matmul(mask, proto).reshape((-1, w, h))
+        # 缩放masks -二值化
+        def scale_mask(masks, new_shape=(1280,1280)):
+            o_shape = self.o_shape #hw
+            scaled_masks = []
+            for mask in masks:
+                new_mask = cv2.resize(mask, new_shape, interpolation=cv2.INTER_LINEAR) # 缩放到输入图
+                top, bottom = int(pad[1]), int(new_shape[0]-pad[1])
+                left, right = int(pad[0]), int(new_shape[1]-pad[0])
+                scaled_mask = new_mask[top:bottom, left:right] # 去填充
+                scaled_mask = cv2.resize(scaled_mask, (o_shape[1], o_shape[0]), interpolation=cv2.INTER_LINEAR) # 缩放到原图
+                scaled_masks.append(scaled_mask)
+            return scaled_masks #np.stack(scaled_masks)
+        scaled_masks = scale_mask(masks)
+        binary_masks = [(m > 0.5).astype(np.uint8) * 255 for m in scaled_masks] #(scaled_masks > 0.5).astype(np.uint8) * 255#[(m > 0.5).astype(np.uint8) * 255 for m in scaled_masks]
+        # binary_masks = binary_masks[0]
+        return scaled_masks, binary_masks
+
+
+    """画轮廓"""
+    def draw_contours(self, binary_masks):
+        # 轮廓
+        img = self.img0
+        results=[]
+        for binary_mask in binary_masks:
+            # print(img.shape, binary_mask.shape)
+            contours = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+            if not contours:
+                continue
+            max_contour = max(contours, key=cv2.contourArea)
+            # cv2.drawContours(img, max_contour, -1, (0, 255, 0), 2)
+            rect = cv2.minAreaRect(max_contour)
+            center, (w, h), angle = rect
+            if w<h:
+                w,h = h,w
+                angle+=90
+            box = np.intp(cv2.boxPoints(((center[0], center[1]), (w, h), angle)))
+            cv2.drawContours(img, [box], -1, (0, 255, 0), 2)
+            cv2.circle(img, (int(center[0]), int(center[1])), 4, (0,255,0), 2)
+            results.append({
+                'center': (int(center[0]), int(center[1])),
+                'angle': angle,
+                'size': (w, h)
+            })
+        # cv2.putText(img, angle_txt, (cx + 10, cy),
+        #             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+        return img, results
+
+
+if __name__=="__main__":
+    seg = YOLO11_Seg()
+    img, results = seg.all_process(conf=0.25, iou=0.7, nm=32)
+    print(results[0]['size'])
+    cv_show(img)
+
+
+
