@@ -1,0 +1,77 @@
+import os
+import numpy as np
+import json
+
+
+def classfier(label):
+    if label == "0":
+        class_type = 0
+    elif label == "1":
+        class_type = 1
+    elif label == "2":
+        class_type = 2
+    elif label == "3":
+        class_type = 3
+    elif label == "4":
+        class_type = 4
+    elif label == "5":
+        class_type = 5
+    elif label == "6":
+        class_type = 6
+    elif label == "7":
+        class_type = 7
+    elif label == "8":
+        class_type = 8
+    elif label == "9":
+        class_type = 9
+    return class_type
+
+def json2yolo(data, i, w, h):
+    p1 = data["shapes"][i]["points"][0]
+    p2 = data["shapes"][i]["points"][1]
+    p3 = data["shapes"][i]["points"][2]
+    p4 = data["shapes"][i]["points"][3]
+    label = data["shapes"][i]["label"]
+    class_type = classfier(label)
+    norm_p1_x, norm_p1_y = round(p1[0] / w, 6), round(p1[1] / h, 6)
+    norm_p2_x, norm_p2_y = round(p2[0] / w, 6), round(p2[1] / h, 6)
+    norm_p3_x, norm_p3_y = round(p3[0] / w, 6), round(p3[1] / h, 6)
+    norm_p4_x, norm_p4_y = round(p4[0] / w, 6), round(p4[1] / h, 6)
+    return class_type, norm_p1_x, norm_p1_y, norm_p2_x, norm_p2_y, norm_p3_x, norm_p3_y, norm_p4_x, norm_p4_y
+
+
+def process(file_path):
+    try:
+        with open(file_path, "r") as f:
+            data = json.load(f)
+            h, w = data["imageHeight"], data["imageWidth"]
+            if 'shapes' in data and len(data['shapes']) > 0:
+                for i in range(len(data['shapes'])):
+                    class_type, norm_p1_x, norm_p1_y, norm_p2_x, norm_p2_y, norm_p3_x, norm_p3_y, norm_p4_x, norm_p4_y = json2yolo(data, i, w, h)
+                    yolo_obb_data = f"{class_type} {norm_p1_x} {norm_p1_y} {norm_p2_x} {norm_p2_y} {norm_p3_x} {norm_p3_y} {norm_p4_x} {norm_p4_y}\n"
+                    with open(yolo_file_path, "a") as f:
+                        f.write(yolo_obb_data)
+
+    except FileNotFoundError:
+        print(f"错误：找不到文件 {file_path}")
+    except json.JSONDecodeError:
+        print(f"错误：文件 {file_path} 不是有效的JSON格式")
+    except Exception as e:
+        print(f"发生错误：{str(e)}")
+    return None
+
+
+if __name__ == "__main__":
+    path = r"D:\all\train\ng9_label" #A
+    yolo_path = r"D:\all\train\ng9_yololabel"
+    # path = r"D:\xm\robot\0723data\B\label" #B
+    # yolo_path = r"D:\xm\robot\0723data\B\yolo_label"
+    # path = r"D:\xm\robot\0723data\T\label" #T
+    # yolo_path = r"D:\xm\robot\0723data\T\yolo_label"
+    os.makedirs(yolo_path, exist_ok=True)
+    for file in os.listdir(path):
+        file_path = os.path.join(path, file)
+        yolo_file_path = os.path.join(yolo_path, os.path.basename(file)[:-5] + ".txt")
+        process(file_path)
+
+
